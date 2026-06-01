@@ -72,20 +72,3 @@ When running `test.py`, the model's diagnostic behavior shifts dramatically depe
 | **`0.00`** | Standard Expert | **75.60%** | **80.72%** | Balanced clinician aiming for zero penalties. Highest overall diagnostic performance. |
 | **`-0.20`** | Cautious / Hesitant | 54.20% | 89.41% | More passive; stops guessing unless certain, suppressing false alarms. |
 | **`-0.50`** | Passive Baseline | 39.98% | **93.46%** | Defaults heavily to the majority class (Healthy/Control). |
-
----
-
-## Recommended `.gitignore` Configuration
-To keep your GitHub repository clean and lightweight, ensure a `.gitignore` file is present in the root directory containing:
-```text
-.venv/
-__pycache__/
-*.pyc
-apnea-ecg-database-1.0.0/
-apnea-ecg-database-1.0.0.zip
-data/
-*.npz
-*.dat
-*.hea
-temp.py
-```

@@ -9,10 +9,12 @@ __pycache__/
 # Data and large files
 apnea-ecg-database-1.0.0/
 apnea-ecg-database-1.0.0.zip
+processed_data.zip
 data/
 *.npz
 *.dat
 *.hea
+*.rar
 
 # Scratchpad files
 temp.py
