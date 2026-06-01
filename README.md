@@ -24,8 +24,8 @@ By utilizing **Static Persona Conditioning** (Return-to-Go / RTG prompting), the
    pip install torch numpy scipy pandas wfdb neurokit2
    ```
 3. **Download Data:** Because the processed data files are too large for GitHub, please download the processed `data/` folder from the cloud link below and place it directly in the root directory of this project:
-   * **Processed Data Link:** `[INSERT YOUR GOOGLE DRIVE / CLOUD LINK HERE]`
-   * *Alternatively, place the raw `apnea-ecg-database-1.0.0` folder in the root directory if you wish to run preprocessing from scratch.*
+   * **Processed Data Link:** `https://drive.google.com/drive/folders/14Ua93MEvPOmxf3_4jQ6BFd6imagkPVks?usp=sharing`
+   * *Alternatively, place the raw `apnea-ecg-database-1.0.0` folder in the root directory if you wish to run preprocessing from scratch. (Note that some versions online omit labels for the testing dataset)*
 
 ---
 
