@@ -62,7 +62,7 @@ python test.py
 
 ---
 
-## Persona Reference Guide
+## Persona Reference Guide 
 
 When running `test.py`, the model's diagnostic behavior shifts dramatically depending on the static `initial_target_rtg` prompt provided to the network:
 
