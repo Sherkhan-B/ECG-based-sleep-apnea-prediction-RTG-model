@@ -9,7 +9,7 @@ Instead of treating sleep apnea detection as a static classification task, this 
 By utilizing **Static Persona Conditioning** (Return-to-Go / RTG prompting), the model's clinical sensitivity and specificity can be dynamically steered at inference time without modifying the underlying network weights or threshold parameters.
 
 ### Core Engineering Details
-* **Feature Extraction:** Extracts 86 physiological features per minute using `neurokit2` and `scipy`, including the foundational **Apnea Band (0.008 - 0.036 Hz)** (equivalent to the 0.5 to 2.2 cycles per minute spectral power fraction defined in PhysioNet literature) via Welch's periodogram.
+* **Feature Extraction:** Extracts 89 physiological features per minute using `neurokit2` and `scipy`, including the foundational **Apnea Band (0.008 - 0.036 Hz)** (equivalent to the 0.5 to 2.2 cycles per minute spectral power fraction defined in PhysioNet literature) via Welch's periodogram.
 * **Data Augmentation:** The training data is augmented with off-policy trajectories from an *Expert Agent* (ground-truth labels), a *Cautious Agent* (+15% random False Positives), and a *Careless Agent* (+30% random False Negatives) to expose the Transformer to varying degrees of clinical error.
 * **Clinical Reward Matrix:** Programmed to mirror clinical risks, penalizing False Positives at `-1.0` and severely penalizing False Negatives (missed apnea) at `-10.0`. Perfect classifications yield a reward of `0.0`.
 * **Patient Isolation:** The evaluation loop automatically flushes the Transformer's context history buffers whenever a new patient boundary is reached (timestamp resets to 0), preventing inter-patient data leakage.
@@ -34,7 +34,7 @@ By utilizing **Static Persona Conditioning** (Return-to-Go / RTG prompting), the
 To reproduce the preprocessing, training, and multi-persona clinical rollouts, run the scripts in the following exact order:
 
 ### 1. Pre-Processing (`data_prep.py` & `prep_test_data.py`)
-Extracts the 86 physiological features from the raw PhysioNet ECG records and generates the multi-persona augmented training trajectories.
+Extracts the 89 physiological features from the raw PhysioNet ECG records and generates the multi-persona augmented training trajectories.
 ```bash
 python data_prep.py
 python prep_test_data.py
