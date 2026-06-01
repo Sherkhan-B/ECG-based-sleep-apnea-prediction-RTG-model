@@ -1,0 +1,18 @@
+# Environments
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data and large files
+apnea-ecg-database-1.0.0/
+apnea-ecg-database-1.0.0.zip
+data/
+*.npz
+*.dat
+*.hea
+
+# Scratchpad files
+temp.py
