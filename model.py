@@ -15,6 +15,10 @@ class DecisionTransformer(nn.Module):
         self.embed_state = nn.Linear(state_dim, hidden_dim)
         self.embed_action = nn.Embedding(action_dim, hidden_dim)
         
+        # Embedding Normalization and Regularization
+        self.embed_ln = nn.LayerNorm(hidden_dim)
+        self.embed_dropout = nn.Dropout(0.1)
+        
         # Native PyTorch Transformer Encoder configured for Causal Masking
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
@@ -22,7 +26,8 @@ class DecisionTransformer(nn.Module):
             dim_feedforward=hidden_dim * 4, 
             dropout=0.1,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=True  # Pre-Layer Normalization 
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
@@ -54,6 +59,10 @@ class DecisionTransformer(nn.Module):
         stacked_inputs = torch.stack(
             (returns_embeddings, state_embeddings, action_embeddings), dim=2
         ).reshape(batch_size, 3 * seq_len, self.hidden_dim)
+        
+        # Apply Embedding Normalization and Dropout
+        stacked_inputs = self.embed_ln(stacked_inputs)
+        stacked_inputs = self.embed_dropout(stacked_inputs)
         
         # Apply causal mask and process
         causal_mask = self._generate_causal_mask(3 * seq_len, device)

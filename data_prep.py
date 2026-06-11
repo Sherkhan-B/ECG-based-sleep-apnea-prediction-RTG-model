@@ -1,22 +1,39 @@
 import wfdb
 import neurokit2 as nk
 import numpy as np
-import pandas as pd  # <-- Added for robust feature alignment
+import pandas as pd  
 import os
 import warnings
+import joblib 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import scipy.signal as signal
 import scipy.interpolate as interp
 import scipy.integrate as integrate
 
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import RobustScaler
+
 warnings.filterwarnings("ignore") 
 
-def process_single_patient(patient_id):
-    """Worker function to process ONE patient from local files. Runs on a separate CPU core."""
+def process_single_patient(patient_args):
+    """Worker function to process ONE patient. Takes a tuple of (patient_id, is_train)."""
+    patient_id, is_train = patient_args
     print(f"--- Starting Patient '{patient_id}' ---")
-    states = []  # Will hold feature dictionaries
+    states = [] 
     actions = []
+    
+    # Determine the cohort group from the patient ID prefix
+    if patient_id.startswith('a'):
+        cohort = 'Apnea Group (A)'
+    elif patient_id.startswith('c'):
+        cohort = 'Control Group (C)'
+    elif patient_id.startswith('b'):
+        cohort = 'Borderline Group (B)'
+    else:
+        cohort = 'Test Cohort (X)'
+        
+    cohort_counts = {'Apnea Group (A)': 0, 'Control Group (C)': 0, 'Borderline Group (B)': 0, 'Test Cohort (X)': 0}
     
     local_data_dir = 'apnea-ecg-database-1.0.0'
     file_path = os.path.join(local_data_dir, patient_id)
@@ -29,28 +46,37 @@ def process_single_patient(patient_id):
         fs = record.fs  
         labels = annotation.symbol 
 
-        # Clean and get peaks once
         cleaned_ecg = nk.ecg_clean(ecg_signal, sampling_rate=fs)
         _, info = nk.ecg_peaks(cleaned_ecg, sampling_rate=fs)
         all_r_peaks = info['ECG_R_Peaks']
 
         for i in range(len(labels)):
-            start_idx = i * 60 * fs
-            end_idx = (i + 1) * 60 * fs
+            # Tally every available minute to track true database distribution
+            cohort_counts[cohort] += 1
+                
+            # Exclude borderline patient data from training vectors
+            if cohort == 'Borderline Group (B)':
+                continue 
+
+            # Offline 55-second Window Augmentation
+            if is_train:
+                offset = np.random.randint(0, int(5 * fs))
+            else:
+                offset = int(2.5 * fs)
+                
+            start_idx = int(i * 60 * fs) + offset
+            end_idx = start_idx + int(55 * fs)
             
             try:
-                # Isolate the R-peaks for just this 1-minute chunk
                 chunk_peaks = all_r_peaks[(all_r_peaks >= start_idx) & (all_r_peaks < end_idx)]
                 chunk_peaks_relative = chunk_peaks - start_idx
                 
                 if len(chunk_peaks_relative) > 5:
                     hrv = nk.hrv(chunk_peaks_relative, sampling_rate=fs)
-                    # Convert to dictionary to keep explicit feature names intact
                     hrv_dict = hrv.iloc[0].to_dict()
                 else:
                     continue 
 
-                # The 5-Minute Lookback Window
                 window_start_idx = max(0, i - 4) * 60 * fs
                 window_peaks = all_r_peaks[(all_r_peaks >= window_start_idx) & (all_r_peaks < end_idx)]
                 
@@ -62,30 +88,24 @@ def process_single_patient(patient_id):
                     time_grid = np.arange(rr_times[0], rr_times[-1], 1/4.0)
                     rr_interp = f_interp(time_grid)
                     
-                    # Dynamically bound nperseg so it never exceeds the signal length
                     safe_nperseg = min(256, len(rr_interp))
                     
-                    # The Apnea Band (0.008 - 0.036 Hz)
                     freqs, psd = signal.welch(rr_interp, fs=4.0, nperseg=safe_nperseg)
                     band_mask = (freqs >= 0.008) & (freqs <= 0.036)
                     
-                    # Use explicit scipy.integrate.trapezoid to avoid NumPy removal errors
                     apnea_power = integrate.trapezoid(psd[band_mask], freqs[band_mask])
                     total_power = integrate.trapezoid(psd, freqs)
                     apnea_band_ratio = apnea_power / total_power if total_power > 0 else 0.0
                     
-                    # Amplitude Variance
                     r_amplitudes = cleaned_ecg[window_peaks]
                     edr_variance = np.var(r_amplitudes)
                 else:
                     apnea_band_ratio = 0.0
                     edr_variance = 0.0
                 
-                # Append engineering features directly into the dictionary
                 hrv_dict['apnea_band_ratio'] = float(apnea_band_ratio)
                 hrv_dict['edr_variance'] = float(edr_variance)
                 
-                # Clean up any potential NaN/Inf edge cases inside values
                 for k, v in hrv_dict.items():
                     if np.isnan(v) or np.isinf(v):
                         hrv_dict[k] = 0.0
@@ -96,57 +116,73 @@ def process_single_patient(patient_id):
                 actions.append(action)
                 
             except Exception:
-                pass # Safe to skip genuinely corrupt single minutes
+                pass 
                 
-        print(f"+++ Finished Patient '{patient_id}' +++")
-        return states, np.array(actions)
+        print(f"+++ Finished '{patient_id}' | Contributed {len(states)} minutes to dataset +++")
+        return states, np.array(actions), cohort_counts
         
     except FileNotFoundError:
         print(f"Failed to find local files for patient {patient_id}.")
-        return [], np.array([])
+        return [], np.array([]), {}
     except Exception as e:
         print(f"Failed to process patient {patient_id}: {e}")
-        return [], np.array([])
+        return [], np.array([]), {}
 
-def download_and_extract_features(patient_list):
-    """Distributes patients across all available CPU cores and aligns features."""
+
+def download_and_extract_features(patient_list, is_train=True):
+    """Distributes patients across CPU cores and tracks class distributions."""
     if not os.path.exists('data'):
         os.makedirs('data')
         
-    all_states = []   # Will be a combined list of dictionaries
+    all_states = [] 
     all_actions = []  
     all_timesteps = [] 
+    total_cohort_distribution = {'Apnea Group (A)': 0, 'Control Group (C)': 0, 'Borderline Group (B)': 0, 'Test Cohort (X)': 0}
 
     max_workers = max(1, os.cpu_count() - 1)
     print(f"\nBooting up {max_workers} CPU cores for parallel processing...")
 
+    patient_args = [(pid, is_train) for pid in patient_list]
+
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_single_patient, pid): pid for pid in patient_list}
+        futures = {executor.submit(process_single_patient, arg): arg[0] for arg in patient_args}
         
         for future in as_completed(futures):
-            states, actions = future.result()
+            states, actions, cohort_counts = future.result()
+            
+            # Aggregate cohort statistics
+            for k in total_cohort_distribution:
+                if k in cohort_counts:
+                    total_cohort_distribution[k] += cohort_counts[k]
+
             if len(states) > 0:
                 all_states.extend(states)
                 all_actions.extend(actions)
                 all_timesteps.extend(np.arange(len(actions)))
 
-    # Safe DataFrame stacking and cross-cohort column alignment ---
-    print("\nAligning features across the entire cohort...")
+    print("\n--- Final Dataset Patient Cohort Distribution ---")
+    for cohort_name, count in total_cohort_distribution.items():
+        if count > 0:
+            print(f"{cohort_name}: {count} total minutes")
+    print("------------------------------------------------")
+
+    # 1. Turn into DataFrame
     df_states = pd.DataFrame(all_states)
     
-    # Save/Load a master column map to guarantee Train/Test shape consistency
+    # 2. Fix internal NaNs immediately
+    df_states = df_states.fillna(0.0)
+    
+    # 3. Establish or load master columns map in the correct sequence
     columns_map_path = 'data/feature_columns.npy'
-    if not os.path.exists(columns_map_path):
-        # Training Mode: Establish the alphabetical master feature order
+    if is_train:
         master_cols = sorted(df_states.columns)
         np.save(columns_map_path, master_cols)
-        print(f"Locked in {len(master_cols)} master feature definitions to disk.")
+        print(f"Locked in {len(master_cols)} master feature definitions.")
     else:
-        # Testing Mode: Force matching column order and structure
         master_cols = np.load(columns_map_path, allow_pickle=True).tolist()
-        print(f"Loaded {len(master_cols)} master feature definitions for alignment.")
+        print(f"Loaded {len(master_cols)} master feature definitions.")
         
-    # Reindex fills completely missing features with 0.0 and aligns everything perfectly
+    # 4. Align columns and handle any completely missing feature columns
     df_states = df_states.reindex(columns=master_cols, fill_value=0.0)
     
     raw_states = df_states.to_numpy()
@@ -157,14 +193,17 @@ def download_and_extract_features(patient_list):
 
 
 def calculate_rtg_and_rewards(agent_actions, true_labels):
-    """Calculates asymmetric RTG based on the agent's performance."""
+    """Calculates cumulative RTG using positive rewards and negative penalties."""
     rewards = np.zeros_like(agent_actions, dtype=np.float32)
     for i in range(len(agent_actions)):
         pred = agent_actions[i]
         truth = true_labels[i]
         
-        if pred == truth:
-            rewards[i] = 0.0
+        # New Reward Structure
+        if pred == 1 and truth == 1:
+            rewards[i] = 10.0   # True Positive
+        elif pred == 0 and truth == 0:
+            rewards[i] = 1.0    # True Negative
         elif pred == 1 and truth == 0:
             rewards[i] = -1.0   # False Positive penalty
         elif pred == 0 and truth == 1:
@@ -179,8 +218,14 @@ def calculate_rtg_and_rewards(agent_actions, true_labels):
 
 
 def generate_synthetic_agents(states, true_labels, timesteps):
-    """Generates perfect, cautious, and careless trajectories."""
-    print("\nGenerating synthetic trajectories for the entire cohort...")
+    """Uses a baseline model thresholding to create behavioral diversity without corrupting labels."""
+    print("\nTraining Baseline Classifier to generate synthetic behaviors...")
+    
+    # Train a fast baseline model on the scaled states
+    clf = LogisticRegression(max_iter=1000, class_weight='balanced')
+    clf.fit(states, true_labels)
+    apnea_probabilities = clf.predict_proba(states)[:, 1]
+
     aug_states = []
     aug_actions = []
     aug_rtgs = []
@@ -194,26 +239,18 @@ def generate_synthetic_agents(states, true_labels, timesteps):
     aug_rtgs.append(perfect_rtgs)
     aug_timesteps.append(timesteps) 
 
-    # 2. The Cautious Agent 
-    cautious_actions = true_labels.copy()
-    normal_indices = np.where(true_labels == 0)[0]
-    fp_count = int(0.15 * len(normal_indices))
-    if fp_count > 0:
-        fp_indices = np.random.choice(normal_indices, fp_count, replace=False)
-        cautious_actions[fp_indices] = 1
+    # 2. The Cautious Agent (Low threshold to alarm -> More False Positives)
+    # If there's even a 20% chance of Apnea, ring the alarm.
+    cautious_actions = (apnea_probabilities >= 0.20).astype(int)
     cautious_rtgs = calculate_rtg_and_rewards(cautious_actions, true_labels)
     aug_states.append(states)
     aug_actions.append(cautious_actions)
     aug_rtgs.append(cautious_rtgs)
     aug_timesteps.append(timesteps) 
 
-    # 3. The Careless Agent
-    careless_actions = true_labels.copy()
-    apnea_indices = np.where(true_labels == 1)[0]
-    fn_count = int(0.30 * len(apnea_indices))
-    if fn_count > 0:
-        fn_indices = np.random.choice(apnea_indices, fn_count, replace=False)
-        careless_actions[fn_indices] = 0
+    # 3. The Careless Agent (High threshold to alarm -> More False Negatives)
+    # Require 80% certainty of Apnea to ring the alarm.
+    careless_actions = (apnea_probabilities >= 0.80).astype(int)
     careless_rtgs = calculate_rtg_and_rewards(careless_actions, true_labels)
     aug_states.append(states)
     aug_actions.append(careless_actions)
@@ -224,20 +261,33 @@ def generate_synthetic_agents(states, true_labels, timesteps):
 
 
 if __name__ == "__main__":
-    # Define the 30 training patients: a01-a20 (Apnea) and c01-c10 (Control)
     apnea_patients = [f'a{i:02d}' for i in range(1, 21)]
     control_patients = [f'c{i:02d}' for i in range(1, 11)]
-    train_patients = apnea_patients + control_patients
+    borderline_patients = [f'b{i:02d}' for i in range(1, 6)]
     
-    # Extract raw features and the new raw timesteps for all 30 patients
-    raw_states, true_labels, raw_timesteps = download_and_extract_features(train_patients)
+    # Combine all 35 training records
+    train_patients = apnea_patients + control_patients + borderline_patients
     
-    # Augment dataset with synthetic agents (passing and unpacking the timesteps)
+    raw_states, true_labels, raw_timesteps = download_and_extract_features(train_patients, is_train=True)
+    
+    # Apply Robust Scaling to replace standard z-score normalization
+    print("\nFitting RobustScaler to features...")
+    scaler = RobustScaler()
+    scaled_states = scaler.fit_transform(raw_states)
+    joblib.dump(scaler, 'data/robust_scaler.pkl')
+    
+    # Augment dataset with synthetic agents using the scaled states
     aug_states, aug_actions, aug_rtgs, aug_timesteps = generate_synthetic_agents(
-        raw_states, true_labels, raw_timesteps
+        scaled_states, true_labels, raw_timesteps
     )
     
-    # Save everything to disk including the clean timesteps
+    # Normalize RTGs to [-1.0, 1.0] ---
+    print("\nNormalizing RTGs to [-1, 1] scale...")
+    rtg_max = np.max(aug_rtgs)
+    rtg_min = np.min(aug_rtgs)
+    aug_rtgs = 2 * ((aug_rtgs - rtg_min) / (rtg_max - rtg_min)) - 1
+    print(f"RTG Bounds Normalized -> Original Min: {rtg_min:.1f} | Original Max: {rtg_max:.1f}")
+    
     save_path = 'data/processed_train_dataset.npz'
     np.savez(
         save_path, 
@@ -250,5 +300,3 @@ if __name__ == "__main__":
     print("\n--- Pipeline Complete ---")
     print(f"Data saved successfully to: {save_path}")
     print(f"Final States Shape: {aug_states.shape}")
-    print(f"Final Actions Shape: {aug_actions.shape}")
-    print(f"Final Timesteps Shape: {aug_timesteps.shape}")
