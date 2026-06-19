@@ -32,7 +32,7 @@ class DecisionTransformerDataset(Dataset):
             print("WARNING: 'timesteps' key missing from npz. Creating standard range.")
             self.timesteps = torch.arange(len(self.states), dtype=torch.long)
             
-        # --- NEW: Build Valid Indices to Prevent Patient Boundary Crossing ---
+        # Build Valid Indices to Prevent Patient Boundary Crossing 
         print("Calculating safe trajectory windows (preventing patient crossover)...")
         valid_indices = []
         total_possible_steps = len(self.states) - context_len

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 class DecisionTransformer(nn.Module):
     def __init__(self, state_dim, action_dim=2, hidden_dim=128, max_ep_len=5000, n_layers=3, n_heads=4):
@@ -8,6 +9,7 @@ class DecisionTransformer(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.max_ep_len = max_ep_len
         
         # Project raw dimensions to uniform embedding size 'hidden_dim'
         self.embed_timestep = nn.Embedding(max_ep_len, hidden_dim)
@@ -34,15 +36,27 @@ class DecisionTransformer(nn.Module):
         # Predictor Head
         self.predict_action = nn.Linear(hidden_dim, action_dim)
 
-    def _generate_causal_mask(self, sz, device):
+        self._cached_mask_size = 0
+        self.register_buffer("_causal_mask", torch.empty(0), persistent=False)
+
+    def _ensure_mask_size(self, sz, device):
         # Generates an upper-triangular matrix of -inf to prevent looking ahead
-        mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
+        if sz > self._cached_mask_size:
+            mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+            mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+            self._causal_mask = mask
+            self._cached_mask_size = sz
+        return self._causal_mask[:sz, :sz]
 
     def forward(self, states, actions, returns_to_go, timesteps):
         batch_size, seq_len, _ = states.shape
         device = states.device
+
+        if timesteps.max().item() >= self.max_ep_len:
+            raise ValueError(
+                f"timestep value {timesteps.max().item()} exceeds max_ep_len={self.max_ep_len}; "
+                "increase max_ep_len when constructing the model."
+            )
         
         # Project each raw stream into hidden_dim vectors
         state_embeddings = self.embed_state(states)
@@ -65,7 +79,7 @@ class DecisionTransformer(nn.Module):
         stacked_inputs = self.embed_dropout(stacked_inputs)
         
         # Apply causal mask and process
-        causal_mask = self._generate_causal_mask(3 * seq_len, device)
+        causal_mask = self._ensure_mask_size(3 * seq_len, device)
         transformer_outputs = self.transformer(stacked_inputs, mask=causal_mask)
         
         # Extract state features (located at index 1 of every triplet)
@@ -83,7 +97,7 @@ if __name__ == "__main__":
     # Create dummy data matching our DataLoader shapes
     batch_size = 32
     seq_len = 20
-    state_dim = 89 # 87 From NeuroKit + 2 From Leading Paper
+    state_dim = np.load('data/processed_train_dataset.npz')['states'].shape[1]
     
     dummy_states = torch.randn(batch_size, seq_len, state_dim)
     dummy_actions = torch.randint(0, 2, (batch_size, seq_len))

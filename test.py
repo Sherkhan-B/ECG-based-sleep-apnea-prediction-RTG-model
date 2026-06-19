@@ -4,6 +4,7 @@ import random
 import os
 from dataset import DecisionTransformerDataset
 from model import DecisionTransformer
+from data_prep import compute_clinical_reward  # FIX: single source of truth for reward semantics
 
 def set_seed(seed=42):
     """Ensures deterministic, reproducible evaluation."""
@@ -15,7 +16,7 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def run_rollout(model, dataset, initial_target_raw_rtg, rtg_min, rtg_max, device, context_len=20):
+def run_rollout(model, dataset, initial_target_raw_rtg, rtg_scale, device, context_len=60):
     model.eval()
     
     eval_length = len(dataset.states)
@@ -28,7 +29,14 @@ def run_rollout(model, dataset, initial_target_raw_rtg, rtg_min, rtg_max, device
     rtgs_hist = torch.zeros((1, context_len, 1), device=device)
     timesteps_hist = torch.zeros((1, context_len), dtype=torch.long, device=device)
     
-    has_real_timesteps = hasattr(dataset, 'timesteps') or 'timesteps' in dataset.__dict__
+    # NOTE: DecisionTransformerDataset.__init__ ALWAYS sets self.timesteps
+    # (either real per-patient-resetting values from the .npz, or a synthetic
+    # torch.arange fallback with a printed WARNING). So this check is always
+    # True in practice and the `else` branch below is unreachable as long as
+    # dataset.py's loader runs first. We keep the explicit fallback only as a
+    # defensive guard in case DecisionTransformerDataset's loading logic ever
+    # changes to NOT set self.timesteps unconditionally.
+    has_real_timesteps = 'timesteps' in dataset.__dict__ and dataset.timesteps is not None
     
     # Track the raw score for the current patient
     current_raw_rtg = initial_target_raw_rtg
@@ -42,11 +50,14 @@ def run_rollout(model, dataset, initial_target_raw_rtg, rtg_min, rtg_max, device
                 safe_t = int(dataset.timesteps[t])
                 is_new_patient = (safe_t == 0 and t > 0)
             else:
+                # Defensive fallback only — should not trigger given dataset.py's
+                # current behavior. 450 is an assumed avg. episode length and
+                # would silently misalign patient boundaries if ever reached.
                 safe_t = t % 450
                 is_new_patient = (t % 450 == 0 and t > 0)
                 
             if is_new_patient:
-                # Reset histories AND reset the target score for the new patient
+                # Reset histories and reset the target score for the new patient
                 states_hist = torch.zeros((1, context_len, model.state_dim), device=device)
                 actions_hist = torch.zeros((1, context_len), dtype=torch.long, device=device)
                 rtgs_hist = torch.zeros((1, context_len, 1), device=device)
@@ -58,8 +69,8 @@ def run_rollout(model, dataset, initial_target_raw_rtg, rtg_min, rtg_max, device
             current_state = dataset.states[t].to(device)
             true_label = dataset.actions[t].item()
             
-            # Convert raw tracked score to the [-1, 1] scale for the model
-            normalized_rtg = 2 * ((current_raw_rtg - rtg_min) / (rtg_max - rtg_min)) - 1
+            # Convert raw tracked score to the SAME scale used in data_prep.py:
+            normalized_rtg = current_raw_rtg / rtg_scale
             normalized_rtg = max(-1.0, min(1.0, normalized_rtg)) # Clamp to prevent embedding blowouts
             
             states_hist = torch.cat([states_hist[:, 1:, :], current_state.unsqueeze(0).unsqueeze(0)], dim=1)
@@ -72,20 +83,21 @@ def run_rollout(model, dataset, initial_target_raw_rtg, rtg_min, rtg_max, device
             
             actions_hist = torch.cat([actions_hist[:, 1:], torch.tensor([[predicted_action]], device=device)], dim=1)
             
-            # --- CALCULATE IMMEDIATE REWARD & DECREMENT ---
+            # FIX: reward now computed via the SAME function used to build
+            # training RTGs in data_prep.py, instead of a separately
+            # maintained inline copy that could silently drift out of sync.
+            immediate_reward = compute_clinical_reward(predicted_action, true_label)
             if predicted_action == 1 and true_label == 1:
-                immediate_reward = 10.0  
                 tp += 1
             elif predicted_action == 0 and true_label == 0:
-                immediate_reward = 1.0   
                 tn += 1
             elif predicted_action == 1 and true_label == 0:
-                immediate_reward = -1.0  
-                fp += 1 
+                fp += 1
             else:
-                immediate_reward = -10.0 
-                fn += 1 
+                fn += 1
 
+            # Current RTG update: RTG represents return still remaining to be
+            # earned, so it shrinks by exactly the reward just received.
             current_raw_rtg -= immediate_reward
 
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -102,15 +114,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print("Loading test dataset and normalization bounds...")
-    test_dataset = DecisionTransformerDataset(data_path='data/processed_test_dataset.npz')
+    test_dataset = DecisionTransformerDataset(data_path='data/processed_test_dataset.npz', context_len=60)
     state_dim = test_dataset.states.shape[1]
     
-    # Load the RTG bounds saved during data prep
-    if os.path.exists('data/rtg_bounds.npy'):
-        rtg_bounds = np.load('data/rtg_bounds.npy')
-        rtg_min, rtg_max = float(rtg_bounds[0]), float(rtg_bounds[1])
+    # Load the fixed RTG scale saved during data prep
+    if os.path.exists('data/rtg_scale.npy'):
+        rtg_scale = float(np.load('data/rtg_scale.npy')[0])
     else:
-        raise FileNotFoundError("rtg_bounds.npy missing! Please run data_prep.py first.")
+        raise FileNotFoundError("rtg_scale.npy missing! Please run data_prep.py first.")
     
     model = DecisionTransformer(state_dim=state_dim, max_ep_len=2000).to(device)
     model.load_state_dict(torch.load('decision_transformer_weights.pth', map_location=device, weights_only=True))
@@ -121,4 +132,4 @@ if __name__ == "__main__":
     test_raw_targets = [5000.0, 3000.0, 1000.0, 0.0, -1000.0, -3000.0]
     
     for target in test_raw_targets:
-        run_rollout(model, test_dataset, initial_target_raw_rtg=target, rtg_min=rtg_min, rtg_max=rtg_max, device=device)
+        run_rollout(model, test_dataset, initial_target_raw_rtg=target, rtg_scale=rtg_scale, device=device)

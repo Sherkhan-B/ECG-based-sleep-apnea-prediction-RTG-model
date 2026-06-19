@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import random
 import os
+import platform
 
 from dataset import DecisionTransformerDataset
 from model import DecisionTransformer
@@ -30,13 +31,21 @@ class FocalLoss(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
-        self.ce_loss = nn.CrossEntropyLoss(weight=self.alpha, reduction='none')
+        # Alpha is applied separately in forward() after pt is computed
+        self.ce_loss = nn.CrossEntropyLoss(weight=None, reduction='none')
 
     def forward(self, inputs, targets):
         ce_loss = self.ce_loss(inputs, targets)
-        pt = torch.exp(-ce_loss) 
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
+        pt = torch.exp(-ce_loss)
+        focal_term = (1 - pt) ** self.gamma
+
+        # Apply alpha as a separate per-sample multiplier
+        if self.alpha is not None:
+            alpha_t = self.alpha.gather(0, targets)
+            focal_loss = alpha_t * focal_term * ce_loss
+        else:
+            focal_loss = focal_term * ce_loss
+
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
@@ -50,16 +59,28 @@ def train():
     print(f"Using device: {device}")
     
     print("Loading dataset...")
-    context_window = 20
+    context_window = 60
     dataset = DecisionTransformerDataset(data_path='data/processed_train_dataset.npz', context_len=context_window)
     
-    # IMPROVEMENT 1: Hardware Acceleration for the DataLoader
+    # FIX: num_workers > 0 uses 'spawn' (not 'fork') for multiprocessing on
+    # Windows. Each worker re-imports this module and re-pickles the full
+    # Dataset object (including the potentially large valid_indices list
+    # built in __init__), which reliably causes hangs / silent worker
+    # crashes / BrokenPipeError on Windows. Forcing num_workers=0 there
+    # keeps data loading single-process and avoids this entirely.
+    # On Linux/Mac (which use 'fork'), num_workers=4 is safe and faster.
+    is_windows = platform.system() == "Windows"
+    safe_num_workers = 0 if is_windows else 4
+    if is_windows:
+        print("Detected Windows — setting num_workers=0 to avoid multiprocessing "
+              "spawn issues with DataLoader (hangs / BrokenPipeError).")
+
     dataloader = DataLoader(
         dataset, 
-        batch_size=32, 
+        batch_size=16,      
         shuffle=True, 
-        num_workers=4,        # Use multiple CPU cores for data loading
-        pin_memory=True       # Speeds up CPU-to-GPU transfer
+        num_workers=safe_num_workers,
+        pin_memory=True       
     )
     
     state_dim = dataset.states.shape[1] 
@@ -69,7 +90,6 @@ def train():
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     
-    # IMPROVEMENT 2: Linear Warmup Scheduler for Transformer Stability
     total_steps = 10 * len(dataloader) # epochs * batches
     warmup_steps = int(0.1 * total_steps) # 10% of training used for warmup
 
@@ -87,6 +107,7 @@ def train():
     
     weight_healthy = np.sqrt(total_samples / count_healthy)
     weight_apnea = np.sqrt(total_samples / count_apnea)
+    
     class_weights = torch.tensor([weight_healthy, weight_apnea], dtype=torch.float).to(device)
     
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)

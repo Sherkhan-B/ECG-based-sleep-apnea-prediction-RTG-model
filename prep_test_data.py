@@ -9,7 +9,7 @@ if __name__ == "__main__":
     print("Starting Test Dataset Extraction...")
     
     # Pass is_train=False to ensure it uses a consistent center crop
-    raw_states, true_labels, raw_timesteps = download_and_extract_features(test_patients, is_train=False)
+    raw_states, true_labels, raw_timesteps, episode_lengths = download_and_extract_features(test_patients, is_train=False)
     
     # Load and apply the RobustScaler fitted on the training set
     scaler_path = 'data/robust_scaler.pkl'
@@ -20,17 +20,16 @@ if __name__ == "__main__":
     else:
         raise FileNotFoundError("robust_scaler.pkl not found! Please run train_prep.py first.")
 
-    dummy_rtgs = np.zeros_like(true_labels, dtype=float)
+    target_rtg_value = 0.5  # Or any value in [-1, 1] you want to test
+    eval_rtgs = np.full_like(true_labels, target_rtg_value, dtype=float)
     
     save_path = 'data/processed_test_dataset.npz'
     
     np.savez(
         save_path, 
-        states=scaled_states,  # Save the SCALED states
+        states=scaled_states,
         actions=true_labels, 
-        rtgs=dummy_rtgs,
-        timesteps=raw_timesteps
+        rtgs=eval_rtgs, 
+        timesteps=raw_timesteps,
+        episode_lengths=episode_lengths
     )
-    
-    print(f"\nTest Data saved successfully to: {save_path}")
-    print(f"Total pure evaluation minutes: {len(scaled_states)}")
